@@ -1,21 +1,28 @@
+"""Kubernetes attack-graph builder (Fase 4, multi-cloud refactor).
+
+Extracted from the old top-level ``graph_builder`` and re-implemented with inverted indexes
+(see ``indexes.py``) so edge construction is ~O(N+E) instead of ~O(N^2). The emitted
+``nx.DiGraph`` — every node, edge and attribute — is byte-identical to the previous builder;
+the golden tests are the proof.
+"""
+
 from __future__ import annotations
 
-from typing import Dict, Iterable, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Tuple
 
 import networkx as nx
 
-from app.domain.analysis_models import ClusterModel, CrownJewelSpec, PolicyRule, Role, RoleBinding, ScenarioConfig
+from evonhi_core.providers.kubernetes.indexes import KubernetesIndexes
+from evonhi_core.providers.kubernetes.semantics import (
+    _permission_targets_secret,
+    _permission_targets_workload_mutation,
+)
 
-SECRET_READ_VERBS = {"get", "list", "watch", "*"}
-WORKLOAD_MUTATION_VERBS = {"create", "patch", "update", "*"}
-WORKLOAD_API_GROUPS = {
-    "deployments": {"apps", "*"},
-    "daemonsets": {"apps", "*"},
-    "statefulsets": {"apps", "*"},
-    "pods": {"", "*"},
-    "jobs": {"batch", "*"},
-    "cronjobs": {"batch", "*"},
-}
+if TYPE_CHECKING:
+    # Used only in annotations (strings under `from __future__ import annotations`).
+    # ClusterModel/Role/RoleBinding are provider-owned; CrownJewelSpec/ScenarioConfig are generic.
+    from evonhi_core.models import CrownJewelSpec, ScenarioConfig
+    from evonhi_core.providers.kubernetes.model import ClusterModel, Role, RoleBinding
 
 
 def node_id(kind: str, namespace: str, name: str) -> str:
@@ -55,94 +62,10 @@ def _resolve_role(binding: RoleBinding, role_index: Dict[Tuple[str, str, str], R
     return role_index.get(("Namespaced", binding.metadata.namespace, binding.role_ref_name))
 
 
-def _permission_targets_secret(resource: str, verb: str, api_group: str) -> bool:
-    if verb not in SECRET_READ_VERBS:
-        return False
-    if resource == "secrets":
-        return api_group in {"", "*"}
-    if resource == "*":
-        return api_group in {"", "*"}
-    return False
-
-
-def _permission_targets_workload_mutation(resource: str, verb: str, api_group: str) -> bool:
-    if verb not in WORKLOAD_MUTATION_VERBS:
-        return False
-    if resource == "*":
-        return api_group in {"", "apps", "batch", "*"}
-    return api_group in WORKLOAD_API_GROUPS.get(resource, set())
-
-
 def _resource_scope(binding: RoleBinding) -> tuple[str, str | None]:
     if binding.scope == "Cluster":
         return "Cluster", None
     return "Namespaced", binding.metadata.namespace
-
-
-def _iter_target_namespaces(graph: nx.DiGraph, grant_scope: str, grant_namespace: str | None) -> set[str]:
-    if grant_scope == "Cluster":
-        return {
-            attrs["namespace"]
-            for _, attrs in graph.nodes(data=True)
-            if attrs.get("namespace")
-        }
-    return {grant_namespace or "default"}
-
-
-def _iter_secret_targets(
-    graph: nx.DiGraph,
-    grant_scope: str,
-    grant_namespace: str | None,
-    resource_names: list[str],
-) -> list[str]:
-    target_namespaces = _iter_target_namespaces(graph, grant_scope, grant_namespace)
-    targets = []
-    for node, attrs in graph.nodes(data=True):
-        if attrs.get("kind") != "secret":
-            continue
-        if attrs.get("namespace") not in target_namespaces:
-            continue
-        if resource_names and attrs.get("name") not in resource_names:
-            continue
-        targets.append(node)
-    return targets
-
-
-def _service_account_targets(
-    graph: nx.DiGraph,
-    current_sa: str,
-    grant_scope: str,
-    grant_namespace: str | None,
-    resource_names: list[str],
-    verb: str,
-) -> list[tuple[str, str | None]]:
-    target_namespaces = _iter_target_namespaces(graph, grant_scope, grant_namespace)
-    workload_targets: list[tuple[str, str | None]] = []
-
-    if resource_names and verb != "create":
-        for node, attrs in graph.nodes(data=True):
-            if attrs.get("kind") != "workload":
-                continue
-            if attrs.get("namespace") not in target_namespaces:
-                continue
-            if attrs.get("name") not in resource_names:
-                continue
-            target_sa = attrs.get("service_account_node")
-            if target_sa and target_sa != current_sa:
-                workload_targets.append((target_sa, attrs.get("name")))
-        if workload_targets:
-            return workload_targets
-
-    targets = []
-    for node, attrs in graph.nodes(data=True):
-        if attrs.get("kind") != "serviceaccount":
-            continue
-        if node == current_sa:
-            continue
-        if attrs.get("namespace") not in target_namespaces:
-            continue
-        targets.append((node, None))
-    return targets
 
 
 def _mark_crown_jewels(graph: nx.DiGraph, jewels: Iterable[CrownJewelSpec]) -> None:
@@ -154,7 +77,9 @@ def _mark_crown_jewels(graph: nx.DiGraph, jewels: Iterable[CrownJewelSpec]) -> N
             graph.nodes[target]["rationale"] = jewel.rationale
 
 
-def _attach_workload_nodes(graph: nx.DiGraph, model: ClusterModel, scenario: ScenarioConfig) -> None:
+def _attach_workload_nodes(
+    graph: nx.DiGraph, model: ClusterModel, scenario: ScenarioConfig, indexes: KubernetesIndexes
+) -> None:
     entry_set = set(scenario.entry_workloads)
     for workload in model.workloads:
         wid = node_id("workload", workload.metadata.namespace, workload.metadata.name)
@@ -170,7 +95,9 @@ def _attach_workload_nodes(graph: nx.DiGraph, model: ClusterModel, scenario: Sce
             service_account=service_account_name,
             service_account_node=sa_id,
         )
+        indexes.add_workload(wid, workload.metadata.namespace, workload.metadata.name, sa_id)
         graph.add_node(sa_id, kind="serviceaccount", name=service_account_name, namespace=workload.metadata.namespace)
+        indexes.add_service_account(sa_id, workload.metadata.namespace)
         automount = workload.automount_token if workload.automount_token is not None else True
         if automount:
             graph.add_edge(
@@ -183,6 +110,7 @@ def _attach_workload_nodes(graph: nx.DiGraph, model: ClusterModel, scenario: Sce
         for secret_name in workload.mounted_secrets:
             sid = node_id("secret", workload.metadata.namespace, secret_name)
             graph.add_node(sid, kind="secret", name=secret_name, namespace=workload.metadata.namespace)
+            indexes.add_secret(sid, workload.metadata.namespace, secret_name)
             graph.add_edge(
                 wid,
                 sid,
@@ -194,17 +122,20 @@ def _attach_workload_nodes(graph: nx.DiGraph, model: ClusterModel, scenario: Sce
 
 def build_attack_graph(model: ClusterModel, scenario: ScenarioConfig) -> nx.DiGraph:
     graph = nx.DiGraph()
+    indexes = KubernetesIndexes()
     role_index = _build_role_index(model)
 
     for secret in model.secrets:
         sid = node_id("secret", secret.metadata.namespace, secret.metadata.name)
         graph.add_node(sid, kind="secret", name=secret.metadata.name, namespace=secret.metadata.namespace, secret_type=secret.kind)
+        indexes.add_secret(sid, secret.metadata.namespace, secret.metadata.name)
 
     for service_account in model.service_accounts:
         sa_id = node_id("serviceaccount", service_account.metadata.namespace, service_account.metadata.name)
         graph.add_node(sa_id, kind="serviceaccount", name=service_account.metadata.name, namespace=service_account.metadata.namespace)
+        indexes.add_service_account(sa_id, service_account.metadata.namespace)
 
-    _attach_workload_nodes(graph, model, scenario)
+    _attach_workload_nodes(graph, model, scenario, indexes)
 
     for binding in model.role_bindings:
         role = _resolve_role(binding, role_index)
@@ -217,6 +148,7 @@ def build_attack_graph(model: ClusterModel, scenario: ScenarioConfig) -> nx.DiGr
             sa_namespace = subject.namespace or binding.metadata.namespace
             sa_id = node_id("serviceaccount", sa_namespace, subject.name)
             graph.add_node(sa_id, kind="serviceaccount", name=subject.name, namespace=sa_namespace)
+            indexes.add_service_account(sa_id, sa_namespace)
             for rule_index, rule in enumerate(role.rules):
                 api_groups = rule.api_groups or [""]
                 for api_group in api_groups:
@@ -262,12 +194,7 @@ def build_attack_graph(model: ClusterModel, scenario: ScenarioConfig) -> nx.DiGr
                             )
 
                             if _permission_targets_secret(resource, verb, api_group):
-                                for secret_id in _iter_secret_targets(
-                                    graph,
-                                    grant_scope=grant_scope,
-                                    grant_namespace=grant_namespace,
-                                    resource_names=resource_names,
-                                ):
+                                for secret_id in indexes.secret_targets(grant_scope, grant_namespace, resource_names):
                                     graph.add_edge(
                                         pid,
                                         secret_id,
@@ -277,14 +204,12 @@ def build_attack_graph(model: ClusterModel, scenario: ScenarioConfig) -> nx.DiGr
                                     )
 
                             if _permission_targets_workload_mutation(resource, verb, api_group):
-                                for target_sa, target_workload in _service_account_targets(
-                                    graph,
-                                    current_sa=sa_id,
-                                    grant_scope=grant_scope,
-                                    grant_namespace=grant_namespace,
-                                    resource_names=resource_names,
-                                    verb=verb,
-                                ):
+                                targets: list[tuple[str, str | None]] = []
+                                if resource_names and verb != "create":
+                                    targets = indexes.workload_targets(grant_scope, grant_namespace, resource_names, current_sa=sa_id)
+                                if not targets:
+                                    targets = indexes.service_account_targets(grant_scope, grant_namespace, current_sa=sa_id)
+                                for target_sa, target_workload in targets:
                                     graph.add_edge(
                                         pid,
                                         target_sa,

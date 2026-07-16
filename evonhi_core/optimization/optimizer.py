@@ -4,11 +4,19 @@ import itertools
 import math
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
-from app.domain.analysis_models import PlanEvaluation, RemediationAction
-from app.engine.path_analysis import find_attack_paths
-from app.engine.remediation import apply_actions
+from evonhi_core.models import PlanEvaluation, RemediationAction
+from evonhi_core.traversal.stateful_search import ReachabilityIndex
+
+# BREAKING CHANGE (Fase 2, refactor multi-cloud): ApplyActions cambió su contrato de
+# retorno de nx.DiGraph a int. Antes: aplicaba acciones y devolvía el grafo remediado
+# completo, que el caller recontaba con find_attack_paths(). Ahora: aplica acciones vía
+# ReachabilityIndex.apply_and_recount() y devuelve remaining_paths directamente, para
+# soportar recount incremental a escala multi-cuenta. Ver commit a904a2b y
+# EVONHI_Multicloud_Refactor_Plan Fase 2.4. Cualquier implementación de ApplyActions
+# escrita contra la firma antigua (que devuelve un grafo) romperá silenciosamente.
+ApplyActions = Callable[[ReachabilityIndex, list[RemediationAction], list[str]], int]
 
 
 @dataclass(slots=True)
@@ -22,11 +30,12 @@ EXACT_SEARCH_LIMIT = 14
 
 def _evaluate(
     genome: Sequence[int],
-    graph,
+    reach_index: ReachabilityIndex,
     actions: Sequence[RemediationAction],
     baseline_paths: int,
     max_paths: int,
     budget: int | None,
+    apply_actions: ApplyActions,
 ) -> PlanEvaluation:
     selected_actions = [action.action_id for bit, action in zip(genome, actions) if bit]
     total_cost = sum(action.cost for bit, action in zip(genome, actions) if bit)
@@ -42,8 +51,14 @@ def _evaluate(
             coverage_ratio=0.0,
         )
 
-    remediated_graph = apply_actions(graph, list(actions), selected_actions)
-    remaining_paths = len(find_attack_paths(remediated_graph, max_paths=max_paths))
+    # BREAKING CHANGE (Fase 2, refactor multi-cloud): ApplyActions cambió su contrato de
+    # retorno de nx.DiGraph a int. Antes: aplicaba acciones y devolvía el grafo remediado
+    # completo, que el caller recontaba con find_attack_paths(). Ahora: aplica acciones vía
+    # ReachabilityIndex.apply_and_recount() y devuelve remaining_paths directamente, para
+    # soportar recount incremental a escala multi-cuenta. Ver commit a904a2b y
+    # EVONHI_Multicloud_Refactor_Plan Fase 2.4. Cualquier implementación de ApplyActions
+    # escrita contra la firma antigua (que devuelve un grafo) romperá silenciosamente.
+    remaining_paths = apply_actions(reach_index, list(actions), selected_actions)
     reduced_paths = max(0, baseline_paths - remaining_paths)
     coverage = (reduced_paths / baseline_paths) if baseline_paths else 0.0
     return PlanEvaluation(
@@ -182,11 +197,12 @@ def _finalize(population: list[_Individual], budget: int | None) -> list[PlanEva
 
 
 def _exact_search(
-    graph,
+    reach_index: ReachabilityIndex,
     actions: Sequence[RemediationAction],
     baseline_paths: int,
     max_paths: int,
     budget: int | None,
+    apply_actions: ApplyActions,
 ) -> list[PlanEvaluation]:
     population: list[_Individual] = []
     for bits in itertools.product((0, 1), repeat=len(actions)):
@@ -194,10 +210,10 @@ def _exact_search(
             total_cost = sum(action.cost for bit, action in zip(bits, actions) if bit)
             if total_cost > budget:
                 continue
-        evaluation = _evaluate(bits, graph, actions, baseline_paths, max_paths, budget)
+        evaluation = _evaluate(bits, reach_index, actions, baseline_paths, max_paths, budget, apply_actions)
         population.append(_Individual(genome=list(bits), evaluation=evaluation))
     if not population:
-        population.append(_Individual(genome=[0] * len(actions), evaluation=_evaluate([0] * len(actions), graph, actions, baseline_paths, max_paths, budget)))
+        population.append(_Individual(genome=[0] * len(actions), evaluation=_evaluate([0] * len(actions), reach_index, actions, baseline_paths, max_paths, budget, apply_actions)))
     return _finalize(population, budget)
 
 
@@ -205,23 +221,35 @@ def optimize_actions(
     graph,
     actions: Sequence[RemediationAction],
     max_paths: int,
+    apply_actions: ApplyActions,
     budget: int | None = None,
     population_size: int = 40,
     generations: int = 25,
     seed: int = 7,
+    # BREAKING CHANGE / Desviación Sancionada (Fase 5, refactor multi-cloud): se expone
+    # `entry_kinds` en la firma por diseño. Antes el índice de reachability se inicializaba con
+    # el default hardcodeado ("workload",), lo que impedía baselinear proveedores no-K8s (p.ej.
+    # AWS, cuyas entradas son "compute") sin disfrazar sus nodos. Ahora el caller pasa el
+    # provider.entry_node_kinds real. Default ("workload",) preserva la retrocompatibilidad y el
+    # golden de K8s. SOLO cambia la firma + la inicialización del ReachabilityIndex; la lógica de
+    # selección NSGA-II (dominancia, crowding, torneo, cruce, mutación) queda intacta.
+    entry_kinds: Sequence[str] = ("workload",),
 ) -> list[PlanEvaluation]:
     random.seed(seed)
-    baseline_paths = len(find_attack_paths(graph, max_paths=max_paths))
+    # Build the reachability index once; every evaluation recounts incrementally against it
+    # instead of rebuilding the graph and re-running a full search.
+    reach_index = ReachabilityIndex(graph, max_paths=max_paths, entry_kinds=entry_kinds)
+    baseline_paths = reach_index.baseline_count()
     if not actions:
         return [PlanEvaluation([], baseline_paths, 0, 0, 0, 0.0)]
 
     genome_length = len(actions)
     if genome_length <= EXACT_SEARCH_LIMIT:
-        return _exact_search(graph, actions, baseline_paths, max_paths, budget)
+        return _exact_search(reach_index, actions, baseline_paths, max_paths, budget, apply_actions)
 
     population: list[_Individual] = []
     for genome in _seed_population(population_size, genome_length):
-        evaluation = _evaluate(genome, graph, actions, baseline_paths, max_paths, budget)
+        evaluation = _evaluate(genome, reach_index, actions, baseline_paths, max_paths, budget, apply_actions)
         population.append(_Individual(genome=genome, evaluation=evaluation))
 
     for _ in range(generations):
@@ -236,9 +264,9 @@ def optimize_actions(
             child_a, child_b = _crossover(parent_a.genome, parent_b.genome, probability=0.85)
             child_a = _mutate(child_a, probability=max(0.05, 1 / genome_length))
             child_b = _mutate(child_b, probability=max(0.05, 1 / genome_length))
-            offspring.append(_Individual(child_a, _evaluate(child_a, graph, actions, baseline_paths, max_paths, budget)))
+            offspring.append(_Individual(child_a, _evaluate(child_a, reach_index, actions, baseline_paths, max_paths, budget, apply_actions)))
             if len(offspring) < population_size:
-                offspring.append(_Individual(child_b, _evaluate(child_b, graph, actions, baseline_paths, max_paths, budget)))
+                offspring.append(_Individual(child_b, _evaluate(child_b, reach_index, actions, baseline_paths, max_paths, budget, apply_actions)))
 
         combined = population + offspring
         new_population: list[_Individual] = []
